@@ -1,4 +1,5 @@
-import argparse, json, sys, time, uuid, hashlib
+import argparse, json, sys, time, uuid, hashlib, csv, statistics
+from pathlib import Path
 from datetime import datetime, timezone
 import zmq
 
@@ -55,6 +56,10 @@ def main():
     parser.add_argument("--endpoint", default="tcp://127.0.0.1:5555", help="Endpoint del GC REP (p.e., tcp://gc:5555)")
     parser.add_argument("--interval", type=float, default=0.2, help="Intervalo entre envíos (s)")
     parser.add_argument("--timeout_ms", type=int, default=5000, help="Timeout de respuesta (ms)")
+    parser.add_argument("--metrics_csv", default="ps_metrics.csv", help="Ruta CSV para almacenar métricas de latencia")
+    parser.add_argument("--summary_json", default=None, help="Ruta opcional para guardar resumen JSON (promedios)")
+    parser.add_argument("--mode", default="A", help="Etiqueta de modo/experimento (A/B)")
+    parser.add_argument("--tag", default=None, help="Etiqueta adicional para identificar la corrida")
     args = parser.parse_args()
 
     print(f"[PS] Enviando solicitudes a {args.endpoint}")
@@ -62,6 +67,8 @@ def main():
     ctx = zmq.Context.instance()
 
     total, ok, fail = 0, 0, 0
+    records = []
+    run_start = time.perf_counter()
     with open(args.file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -81,26 +88,97 @@ def main():
             sock.setsockopt(zmq.RCVTIMEO, args.timeout_ms)
             sock.setsockopt(zmq.LINGER, 0)
 
+            t0 = time.perf_counter()
+            send_ts = iso_now_ms()
+            id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
             try:
                 sock.send_json(msg)
                 reply = sock.recv_json()
                 ok += 1
-                id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
-                print(f"[PS][OK] {op} id={id_log} ↦ {reply}")
+                recv_ts = iso_now_ms()
+                lat_ms = int((time.perf_counter() - t0) * 1000)
+                print(f"[PS][OK] {op} id={id_log} {lat_ms}ms ↦ {reply}")
+                records.append({
+                    "mode": args.mode,
+                    "tag": args.tag or "",
+                    "op": op,
+                    "id": id_log,
+                    "status": "OK",
+                    "latency_ms": lat_ms,
+                    "msg": reply.get("msg") if isinstance(reply, dict) else "",
+                    "t_send": send_ts,
+                    "t_recv": recv_ts,
+                    "endpoint": args.endpoint,
+                })
             except zmq.Again:
                 fail += 1
-                id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
                 print(f"[PS][WARN] Timeout para id={id_log}")
+                records.append({
+                    "mode": args.mode,
+                    "tag": args.tag or "",
+                    "op": op,
+                    "id": id_log,
+                    "status": "TIMEOUT",
+                    "latency_ms": None,
+                    "msg": "TIMEOUT",
+                    "t_send": send_ts,
+                    "t_recv": iso_now_ms(),
+                    "endpoint": args.endpoint,
+                })
             except Exception as e:
                 fail += 1
-                id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
                 print(f"[PS][ERROR] id={id_log} fallo: {e}")
+                records.append({
+                    "mode": args.mode,
+                    "tag": args.tag or "",
+                    "op": op,
+                    "id": id_log,
+                    "status": "ERROR",
+                    "latency_ms": None,
+                    "msg": str(e),
+                    "t_send": send_ts,
+                    "t_recv": iso_now_ms(),
+                    "endpoint": args.endpoint,
+                })
             finally:
                 sock.close(0)
 
             time.sleep(max(0.0, args.interval))
 
-    print(f"[PS] Terminado. total={total} ok={ok} fail={fail}")
+    run_end = time.perf_counter()
+    duration = max(run_end - run_start, 0.0001)
+    throughput = ok / duration
+
+    if args.metrics_csv:
+        path = Path(args.metrics_csv)
+        first = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as csvfile:
+            fieldnames = ["mode", "tag", "op", "id", "status", "latency_ms", "msg", "t_send", "t_recv", "endpoint"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            if first:
+                writer.writeheader()
+            for r in records:
+                writer.writerow(r)
+
+    latencies_ok = [r["latency_ms"] for r in records if r["latency_ms"] is not None and r["status"] == "OK"]
+    summary = {
+        "mode": args.mode,
+        "tag": args.tag,
+        "file": args.file,
+        "endpoint": args.endpoint,
+        "total": total,
+        "ok": ok,
+        "fail": fail,
+        "duration_s": round(duration, 3),
+        "throughput_ops_s": round(throughput, 3),
+        "avg_latency_ms": round(statistics.mean(latencies_ok), 2) if latencies_ok else None,
+        "stdev_latency_ms": round(statistics.pstdev(latencies_ok), 2) if len(latencies_ok) > 1 else None,
+    }
+    print(f"[PS] Terminado. total={total} ok={ok} fail={fail} thr={summary['throughput_ops_s']} op/s avg_lat={summary['avg_latency_ms']}")
+
+    if args.summary_json:
+        Path(args.summary_json).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
     ctx.term()
 
 

@@ -1,16 +1,39 @@
-import argparse, json, sqlite3, os, uuid
+import argparse, json, sqlite3, os, uuid, threading, csv, time
+from typing import Tuple
 from datetime import datetime, timedelta, timezone
 import zmq
-from common.config import GA_REP_ADDR, DB_PATH
+from common.config import (
+    GA_REP_ADDR,
+    GA_REPLICA_PULL_BIND,
+    GA_REPLICA_PUSH_CONNECT,
+    DB_PATH,
+)
 
 
 def iso_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def append_metric(path: str, row: dict):
+    if not path:
+        return
+    try:
+        first = not os.path.exists(path)
+    except Exception:
+        first = False
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["op","ok","id","latency_ms","msg","ts"])
+            if first:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        pass
 
 def connect(db_path: str):
     con = sqlite3.connect(db_path, timeout=10, isolation_level=None)  # autocommit OFF -> usaremos BEGIN
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     return con
 
 
@@ -121,10 +144,91 @@ def op_prestamo(con: sqlite3.Connection, data: dict) -> dict:
     return {"ok": True, "msg": "PRESTAMO_REALIZADO", "fechaEntrega": fecha_entrega_resp, "ejemplarId": cur_ins.lastrowid}
 
 
+def apply_operation(con: sqlite3.Connection, data: dict) -> Tuple[dict, str, str, str]:
+    """
+    Ejecuta la operación dentro de una transacción y retorna (resultado, op, idsol, idem_key).
+    Lanza ValueError si la operación no es soportada.
+    """
+    op = (data.get("op") or data.get("tipo") or "").upper()
+    idem = data.get("idempotencyKey")
+    idsol = data.get("idSolicitud") or data.get("idOperacion") or "?"
+    ts = data.get("timestamp") or data.get("ts") or iso_now()
+
+    con.execute("BEGIN")
+    if not idem:
+        idem = f"NOIDEMP-{op}-{idsol}"
+
+    if op == "PRESTAMO":
+        cur_idem = con.execute("SELECT 1 FROM applied_ops WHERE idempotencyKey = ?", (idem,))
+        if cur_idem.fetchone():
+            con.execute("COMMIT")
+            return {"ok": False, "msg": "YA_APLICADA"}, op, idsol, idem
+        res = op_prestamo(con, data)
+        if res.get("ok"):
+            apply_idempotency(con, idem, op, idsol, ts)
+    elif op == "DEVOLUCION":
+        ya = apply_idempotency(con, idem, op, idsol, ts)
+        if ya:
+            con.execute("COMMIT")
+            return {"ok": True, "msg": "Ya aplicado (idempotente)."}, op, idsol, idem
+        res = op_devolucion(con, data)
+    elif op == "RENOVACION":
+        ya = apply_idempotency(con, idem, op, idsol, ts)
+        if ya:
+            con.execute("COMMIT")
+            return {"ok": True, "msg": "Ya aplicado (idempotente)."}, op, idsol, idem
+        res = op_renovacion(con, data)
+    else:
+        con.execute("ROLLBACK")
+        raise ValueError(f"op no soportada: {op}")
+
+    con.execute("COMMIT")
+    return res, op, idsol, idem
+
+
+def start_replica_listener(bind_addr: str, db_path: str):
+    def _loop():
+        ctx = zmq.Context.instance()
+        pull = ctx.socket(zmq.PULL)
+        pull.bind(bind_addr)
+        con_replica = connect(db_path)
+        print(f"[GA-SEC] Replicación escuchando en {bind_addr}")
+        try:
+            while True:
+                raw = pull.recv()
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except Exception as e:
+                    print(f"[GA-SEC] Replicación descartada por JSON inválido: {e}")
+                    continue
+                try:
+                    res, op, idsol, idem = apply_operation(con_replica, data)
+                    print(f"[GA-SEC] Replica {op} id={idsol} -> {res}")
+                except Exception as e:
+                    try:
+                        con_replica.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    print(f"[GA-SEC] Error aplicando replica: {e}")
+        except KeyboardInterrupt:
+            print("\n[GA-SEC] Replicación detenida")
+        finally:
+            pull.close(0)
+            con_replica.close()
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser(description="Gestor de Almacenamiento (GA)")
     ap.add_argument("--rep", default=GA_REP_ADDR, help="Endpoint REP bind (p.e., tcp://*:5570)")
+    ap.add_argument("--role", choices=["primary", "secondary"], default="primary", help="Rol del GA para replicación/failover")
+    ap.add_argument("--replica_push", default=GA_REPLICA_PUSH_CONNECT, help="(Primario) endpoint PUSH hacia el secundario")
+    ap.add_argument("--replica_pull", default=GA_REPLICA_PULL_BIND, help="(Secundario) endpoint PULL para recibir del primario")
     ap.add_argument("--db", default=DB_PATH, help="Ruta a la BD SQLite (biblioteca.db)")
+    ap.add_argument("--metrics_csv", default=None, help="Ruta para métricas de GA")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.db), exist_ok=True)
@@ -132,6 +236,15 @@ def main():
 
     ctx = zmq.Context.instance()
     rep = ctx.socket(zmq.REP); rep.bind(args.rep)
+    replica_push = None
+    if args.role == "primary" and args.replica_push:
+        replica_push = ctx.socket(zmq.PUSH)
+        replica_push.connect(args.replica_push)
+        replica_push.setsockopt(zmq.LINGER, 0)
+        print(f"[GA] Replicando (PUSH) a {args.replica_push}")
+    if args.role == "secondary":
+        start_replica_listener(args.replica_pull, args.db)
+        print(f"[GA] Modo secundario escuchando replicación en {args.replica_pull}")
 
     print(f"[GA] REP en {args.rep}")
     print(f"[GA] Usando BD: {args.db}")
@@ -146,51 +259,27 @@ def main():
                 rep.send_string(json.dumps({"ok": False, "msg": f"JSON invalido: {e}"}))
                 continue
 
-            op = (data.get("op") or data.get("tipo") or "").upper()
-            idem = data.get("idempotencyKey")
+            op = (data.get("op") or data.get("tipo") or "?").upper()
             idsol = data.get("idSolicitud") or data.get("idOperacion") or "?"
-            ts = data.get("timestamp") or data.get("ts") or iso_now()
-
+            t0 = time.perf_counter()
             try:
-                con.execute("BEGIN")
-                if not idem:
-                    idem = f"NOIDEMP-{op}-{idsol}"
-
-                if op == "PRESTAMO":
-                    cur_idem = con.execute("SELECT 1 FROM applied_ops WHERE idempotencyKey = ?", (idem,))
-                    if cur_idem.fetchone():
-                        con.execute("COMMIT")
-                        rep.send_string(json.dumps({"ok": False, "msg": "YA_APLICADA"}))
-                        print(f"[GA] {op} id={idsol} -> YA_APLICADA")
-                        continue
-                    res = op_prestamo(con, data)
-                    if res.get("ok"):
-                        apply_idempotency(con, idem, op, idsol, ts)
-                elif op == "DEVOLUCION":
-                    ya = apply_idempotency(con, idem, op, idsol, ts)
-                    if ya:
-                        con.execute("COMMIT")
-                        rep.send_string(json.dumps({"ok": True, "msg": "Ya aplicado (idempotente)."}))
-                        print(f"[GA] {op} id={idsol} -> ya aplicado (idempotente)")
-                        continue
-                    res = op_devolucion(con, data)
-                elif op == "RENOVACION":
-                    ya = apply_idempotency(con, idem, op, idsol, ts)
-                    if ya:
-                        con.execute("COMMIT")
-                        rep.send_string(json.dumps({"ok": True, "msg": "Ya aplicado (idempotente)."}))
-                        print(f"[GA] {op} id={idsol} -> ya aplicado (idempotente)")
-                        continue
-                    res = op_renovacion(con, data)
-                else:
-                    con.execute("ROLLBACK")
-                    rep.send_string(json.dumps({"ok": False, "msg": "op no soportada (Ent1)"}))
-                    print(f"[GA] op desconocida: {op} data={data}")
-                    continue
-
-                con.execute("COMMIT")
+                res, op, idsol, idem = apply_operation(con, data)
+                if args.role == "primary" and replica_push and res.get("ok"):
+                    try:
+                        replica_push.send_string(json.dumps(data), flags=zmq.NOBLOCK)
+                    except Exception as e:
+                        print(f"[GA] No se pudo replicar {op} id={idsol}: {e}")
                 rep.send_string(json.dumps(res))
                 print(f"[GA] {op} id={idsol} -> {res}")
+                lat_ms = int((time.perf_counter() - t0) * 1000)
+                append_metric(args.metrics_csv, {"op": op, "ok": res.get("ok"), "id": idsol, "latency_ms": lat_ms, "msg": res.get("msg"), "ts": iso_now()})
+            except ValueError as e:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                rep.send_string(json.dumps({"ok": False, "msg": str(e)}))
+                print(f"[GA] op desconocida: {e} data={data}")
             except Exception as e:
                 try:
                     con.execute("ROLLBACK")
@@ -202,7 +291,10 @@ def main():
     except KeyboardInterrupt:
         print("\n[GA] Saliendo...")
     finally:
-        rep.close(0); ctx.term(); con.close()
+        rep.close(0);
+        if replica_push:
+            replica_push.close(0)
+        ctx.term(); con.close()
 
 
 if __name__ == "__main__":

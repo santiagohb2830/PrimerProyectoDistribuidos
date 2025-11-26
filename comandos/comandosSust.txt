@@ -79,3 +79,30 @@ SI EL VENV JODE EN WINDOWS:
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
 
 .\.venv\Scripts\Activate.ps1
+
+# ==============================
+# MODO A / MODO B (experimentos)
+# ==============================
+# Modo A (baseline, sin failover): ejecutar sólo GA primario
+#   python -m ga.ga --role primary --rep tcp://*:5570 --db ga/biblioteca.db
+#
+# Modo B (con réplica + failover):
+#   TERMINAL 1 — GA Primario
+#       python -m ga.ga --role primary --rep tcp://*:5570 --db ga/biblioteca_prim.db --replica_push tcp://127.0.0.1:5580
+#   TERMINAL 2 — GA Secundario (escucha peticiones y replicación)
+#       python -m ga.ga --role secondary --rep tcp://*:5571 --db ga/biblioteca_sec.db --replica_pull tcp://*:5580
+#   TERMINAL 3 — Actor DEVOL
+#       python -m actores.actor_devol --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+#   TERMINAL 4 — Actor RENOV
+#       python -m actores.actor_renov --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+#   TERMINAL 5 — Actor PRESTAMO (sincrónico)
+#       python -m actores.actor_prestamo --rep tcp://*:5558 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+#   TERMINAL 6 — GC
+#       python -m gestor_carga.gc --rep tcp://*:5555 --pub tcp://*:5560 --actor_prestamo tcp://127.0.0.1:5558
+#   TERMINAL 7..n — PS o carga:
+#       python -m ps.ps --file ps/data/sol_sede1.txt --endpoint tcp://127.0.0.1:5555 --mode B --metrics_csv ps_metrics.csv
+#       python -m ps.run_load --files ps/data/sol_sede1.txt ps/data/sol_sede2.txt --endpoint tcp://127.0.0.1:5555 --mode B --metrics_csv ps_metrics.csv --summary_dir metrics_summaries
+#
+# Análisis de métricas:
+#   python -m tools.analyze_metrics --file ps_metrics.csv --mode A
+#   python -m tools.analyze_metrics --file ps_metrics.csv --mode B

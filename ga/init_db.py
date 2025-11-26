@@ -1,4 +1,4 @@
-import sqlite3, os, random
+import sqlite3, os, random, argparse
 from datetime import datetime, timedelta, timezone
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "biblioteca.db")
@@ -10,19 +10,19 @@ def iso_now():
 def iso_days_from_now(days: int):
     return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def main():
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
+def seed_db(db_path: str, n_libros: int = 1000, prest_s1: int = 50, prest_s2: int = 150):
+    if os.path.exists(db_path):
+        os.remove(db_path)
 
-    with sqlite3.connect(DB_NAME) as con, open(SCHEMA, "r", encoding="utf-8") as f:
+    with sqlite3.connect(db_path) as con, open(SCHEMA, "r", encoding="utf-8") as f:
         con.executescript(f.read())
 
-        # 1000 libros, mitad en SEDE1 y mitad en SEDE2 (simple)
         libros = []
-        for i in range(1, 1001):
+        mitad = n_libros // 2
+        for i in range(1, n_libros + 1):
             idLibro = f"L{i:04d}"
-            sede = "SEDE1" if i <= 500 else "SEDE2"
-            tot = 1  # simple para Entrega 1
+            sede = "SEDE1" if i <= mitad else "SEDE2"
+            tot = 1
             disp = 1
             titulo = f"Libro {i:04d}"
             libros.append((idLibro, titulo, sede, tot, disp))
@@ -32,17 +32,15 @@ def main():
             libros
         )
 
-        # 200 prestados: 50 en SEDE1 (en rango 1..500), 150 en SEDE2 (501..1000)
-        prestados_s1 = list(range(1, 501))
-        prestados_s2 = list(range(501, 1001))
+        prestados_s1 = list(range(1, mitad + 1))
+        prestados_s2 = list(range(mitad + 1, n_libros + 1))
         random.seed(42)
-        sample_s1 = random.sample(prestados_s1, 50)
-        sample_s2 = random.sample(prestados_s2, 150)
+        sample_s1 = random.sample(prestados_s1, prest_s1)
+        sample_s2 = random.sample(prestados_s2, prest_s2)
         activos = []
         now = iso_now()
         plus14 = iso_days_from_now(14)
 
-        # baja disponibles a 0 por cada prestamo (tot=1)
         for i in sample_s1:
             idLibro = f"L{i:04d}"
             con.execute("UPDATE libros SET ejemplares_disponibles = 0 WHERE idLibro = ?", (idLibro,))
@@ -62,7 +60,16 @@ def main():
         """, activos)
 
         con.commit()
-        print(f"[INIT-DB] BD creada en {DB_NAME} con 1000 libros y 200 préstamos ACTIVO.")
+        print(f"[INIT-DB] BD creada en {db_path} con {n_libros} libros y {prest_s1 + prest_s2} préstamos ACTIVO.")
+
+def main():
+    ap = argparse.ArgumentParser(description="Inicializa la BD con datos base.")
+    ap.add_argument("--db", default=DB_NAME, help="Ruta destino de la BD SQLite")
+    ap.add_argument("--libros", type=int, default=1000, help="Cantidad de libros a generar")
+    ap.add_argument("--prest_s1", type=int, default=50, help="Préstamos activos iniciales en SEDE1")
+    ap.add_argument("--prest_s2", type=int, default=150, help="Préstamos activos iniciales en SEDE2")
+    args = ap.parse_args()
+    seed_db(args.db, args.libros, args.prest_s1, args.prest_s2)
 
 if __name__ == "__main__":
     main()

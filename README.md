@@ -83,6 +83,118 @@ El sistema requiere **6 terminales activas**:
 
 ---
 
+## Guía rápida de comandos y casos de prueba
+
+### Requisitos
+- Python 3.8+
+- `pip install pyzmq`
+- En shells como zsh pon las direcciones con `*` entre comillas: `--rep 'tcp://*:5570'`.
+
+### Preparación de BD (primera vez)
+```bash
+cd ga
+python3 init_db.py                    # crea ga/biblioteca.db
+# o bien inicializa prim/sec iguales:
+python3 seed_replicas.py --primary ga/biblioteca_prim.db --secondary ga/biblioteca_sec.db
+cd ..
+```
+
+### Modo básico (sin réplica/failover)
+Usa 6 terminales en la raíz del repo:
+```bash
+# 1) GA
+python3 -m ga.ga --rep 'tcp://*:5570' --db ga/biblioteca.db
+
+# 2) Actor DEVOL
+python3 -m actores.actor_devol --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570
+
+# 3) Actor RENOV
+python3 -m actores.actor_renov --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570
+
+# 4) Actor PRESTAMO (síncrono)
+python3 -m actores.actor_prestamo --rep 'tcp://*:5558' --ga_primary tcp://127.0.0.1:5570
+
+# 5) Gestor de Carga (GC)
+python3 -m gestor_carga.gc --rep 'tcp://*:5555' --pub 'tcp://*:5560' --actor_prestamo tcp://127.0.0.1:5558
+
+# 6) PS (ejemplo sede1)
+python3 -m ps.ps --file ps/data/sol_sede1.txt --endpoint tcp://127.0.0.1:5555
+# Otro PS opcional:
+python3 -m ps.ps --file ps/data/sol_sede2.txt --endpoint tcp://127.0.0.1:5555
+```
+
+### Modo con réplica y failover
+```bash
+# GA primario
+python3 -m ga.ga --role primary --rep 'tcp://*:5570' --db ga/biblioteca_prim.db --replica_push tcp://127.0.0.1:5580
+
+# GA secundario (escucha peticiones y replicación)
+python3 -m ga.ga --role secondary --rep 'tcp://*:5571' --db ga/biblioteca_sec.db --replica_pull 'tcp://*:5580'
+
+# Actores (failover incluido)
+python3 -m actores.actor_devol --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+python3 -m actores.actor_renov --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+python3 -m actores.actor_prestamo --rep 'tcp://*:5558' --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+
+# GC
+python3 -m gestor_carga.gc --rep 'tcp://*:5555' --pub 'tcp://*:5560' --actor_prestamo tcp://127.0.0.1:5558
+# Para modo B (DEV/REN síncronos, pruebas de desempeño):
+# python3 -m gestor_carga.gc --rep 'tcp://*:5555' --pub 'tcp://*:5560' --actor_prestamo tcp://127.0.0.1:5558 --sync_devren --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+
+# PS
+python3 -m ps.ps --file ps/data/sol_sede1.txt --endpoint tcp://127.0.0.1:5555 --mode B --metrics_csv ps_metrics.csv
+```
+
+### Comandos para la sustentación (demo completa)
+1) Sembrar BDs idénticas:
+```bash
+python3 ga/seed_replicas.py --primary ga/biblioteca_prim.db --secondary ga/biblioteca_sec.db
+```
+2) Levantar GA primario/secundario (dos terminales):
+```bash
+python3 -m ga.ga --role primary --rep 'tcp://*:5570' --db ga/biblioteca_prim.db --replica_push tcp://127.0.0.1:5580 --metrics_csv ga_metrics_prim.csv
+python3 -m ga.ga --role secondary --rep 'tcp://*:5571' --db ga/biblioteca_sec.db --replica_pull 'tcp://*:5580' --metrics_csv ga_metrics_sec.csv
+```
+3) Actores (tres terminales):
+```bash
+python3 -m actores.actor_devol --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+python3 -m actores.actor_renov --sub tcp://127.0.0.1:5560 --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+python3 -m actores.actor_prestamo --rep 'tcp://*:5558' --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571
+```
+4) GC (elige modo A básico o modo B con DEV/REN síncronos):
+```bash
+# Modo A (baseline)
+python3 -m gestor_carga.gc --rep 'tcp://*:5555' --pub 'tcp://*:5560' --actor_prestamo tcp://127.0.0.1:5558 --metrics_csv gc_metrics.csv
+# Modo B (DEV/REN síncronos, usado en pruebas de desempeño)
+python3 -m gestor_carga.gc --rep 'tcp://*:5555' --pub 'tcp://*:5560' --actor_prestamo tcp://127.0.0.1:5558 --sync_devren --ga_primary tcp://127.0.0.1:5570 --ga_secondary tcp://127.0.0.1:5571 --metrics_csv gc_metrics.csv
+```
+5) PS/carga (dos o más terminales):
+```bash
+python3 -m ps.ps --file ps/data/sol_sede1.txt --endpoint tcp://127.0.0.1:5555 --mode A --metrics_csv ps_metrics.csv
+python3 -m ps.ps --file ps/data/sol_sede2.txt --endpoint tcp://127.0.0.1:5555 --mode A --metrics_csv ps_metrics.csv
+# Para experimentos 2 min / 4-6-10 PS:
+python3 -m ps.run_load --files ps/data/sol_sede1.txt ps/data/sol_sede2.txt --endpoint tcp://127.0.0.1:5555 --mode A --duration_s 120 --metrics_csv ps_metrics.csv --summary_dir metrics_summaries
+```
+6) Failover en vivo: detén el GA primario y envía más solicitudes; los actores seguirán usando el secundario sin reiniciar GC/PS.
+
+### Carga y métricas
+- Disparar carga paralela con varios PS:
+```bash
+python3 -m ps.run_load --files ps/data/sol_sede1.txt ps/data/sol_sede2.txt --endpoint tcp://127.0.0.1:5555 --mode A --metrics_csv ps_metrics.csv --summary_dir metrics_summaries
+```
+- Analizar métricas PS:
+```bash
+python3 -m tools.analyze_metrics --file ps_metrics.csv --mode A
+```
+
+### Casos de prueba rápidos
+- **Préstamo exitoso**: agrega en un archivo de PS una línea `{"op":"PRESTAMO","idUsuario":"U001","idLibro":"L100"}` y verifica que GC responde `ok=True` y GA descuenta ejemplar.
+- **Préstamo sin stock**: usa un `idLibro` inexistente o sin ejemplares; espera `ok=False` con mensaje `NO_HAY_EJEMPLARES` o `LIBRO_NO_EXISTE`.
+- **Devolución idempotente**: repite dos veces la misma solicitud `DEVOLUCION` (misma `idempotencyKey`) y observa que la segunda responde como aplicada previamente.
+- **Failover**: en modo con réplica, mata el GA primario y envía más solicitudes; los actores deben responder usando el secundario sin reiniciar GC/PS.
+
+---
+
 ## Dependencias
 
 * Python 3.8+

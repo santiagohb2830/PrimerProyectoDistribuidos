@@ -1,4 +1,4 @@
-import argparse, json, sqlite3, os, uuid, threading
+import argparse, json, sqlite3, os, uuid, threading, csv, time
 from typing import Tuple
 from datetime import datetime, timedelta, timezone
 import zmq
@@ -13,6 +13,21 @@ from common.config import (
 def iso_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def append_metric(path: str, row: dict):
+    if not path:
+        return
+    try:
+        first = not os.path.exists(path)
+    except Exception:
+        first = False
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["op","ok","id","latency_ms","msg","ts"])
+            if first:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        pass
 
 def connect(db_path: str):
     con = sqlite3.connect(db_path, timeout=10, isolation_level=None)  # autocommit OFF -> usaremos BEGIN
@@ -213,6 +228,7 @@ def main():
     ap.add_argument("--replica_push", default=GA_REPLICA_PUSH_CONNECT, help="(Primario) endpoint PUSH hacia el secundario")
     ap.add_argument("--replica_pull", default=GA_REPLICA_PULL_BIND, help="(Secundario) endpoint PULL para recibir del primario")
     ap.add_argument("--db", default=DB_PATH, help="Ruta a la BD SQLite (biblioteca.db)")
+    ap.add_argument("--metrics_csv", default=None, help="Ruta para métricas de GA")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.db), exist_ok=True)
@@ -245,6 +261,7 @@ def main():
 
             op = (data.get("op") or data.get("tipo") or "?").upper()
             idsol = data.get("idSolicitud") or data.get("idOperacion") or "?"
+            t0 = time.perf_counter()
             try:
                 res, op, idsol, idem = apply_operation(con, data)
                 if args.role == "primary" and replica_push and res.get("ok"):
@@ -254,6 +271,8 @@ def main():
                         print(f"[GA] No se pudo replicar {op} id={idsol}: {e}")
                 rep.send_string(json.dumps(res))
                 print(f"[GA] {op} id={idsol} -> {res}")
+                lat_ms = int((time.perf_counter() - t0) * 1000)
+                append_metric(args.metrics_csv, {"op": op, "ok": res.get("ok"), "id": idsol, "latency_ms": lat_ms, "msg": res.get("msg"), "ts": iso_now()})
             except ValueError as e:
                 try:
                     con.execute("ROLLBACK")

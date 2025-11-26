@@ -10,6 +10,7 @@ def main():
     ap.add_argument("--mode", default="A", help="Etiqueta modo/experimento (A/B)")
     ap.add_argument("--metrics_csv", default="ps_metrics.csv", help="CSV global donde todos los PS escriben métricas")
     ap.add_argument("--summary_dir", default=None, help="Directorio opcional para almacenar resúmenes JSON individuales")
+    ap.add_argument("--duration_s", type=int, default=None, help="Si se indica, cada PS repetirá su archivo hasta cumplir esta duración (segundos)")
     args = ap.parse_args()
 
     procs = []
@@ -31,6 +32,8 @@ def main():
             "--tag", tag,
             "--metrics_csv", args.metrics_csv,
         ]
+        if args.duration_s:
+            cmd.extend(["--duration_s", str(args.duration_s)])
         if summary_path:
             cmd.extend(["--summary_json", str(summary_path)])
         print(f"[RUN-LOAD] Lanzando {cmd}")

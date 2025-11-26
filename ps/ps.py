@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--summary_json", default=None, help="Ruta opcional para guardar resumen JSON (promedios)")
     parser.add_argument("--mode", default="A", help="Etiqueta de modo/experimento (A/B)")
     parser.add_argument("--tag", default=None, help="Etiqueta adicional para identificar la corrida")
+    parser.add_argument("--duration_s", type=float, default=None, help="Si se indica, repite el archivo hasta cumplir esta duración (segundos)")
     args = parser.parse_args()
 
     print(f"[PS] Enviando solicitudes a {args.endpoint}")
@@ -69,81 +70,90 @@ def main():
     total, ok, fail = 0, 0, 0
     records = []
     run_start = time.perf_counter()
-    with open(args.file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            try:
-                raw = json.loads(line)
-                msg, op = ensure_message_contract(raw)
-            except Exception as e:
-                fail += 1
-                print(f"[PS][ERROR] Línea {total} inválida: {e}")
-                continue
+    def send_all_lines():
+        nonlocal total, ok, fail
+        with open(args.file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                total += 1
+                try:
+                    raw = json.loads(line)
+                    msg, op = ensure_message_contract(raw)
+                except Exception as e:
+                    fail += 1
+                    print(f"[PS][ERROR] Línea {total} inválida: {e}")
+                    continue
 
-            sock = ctx.socket(zmq.REQ)
-            sock.connect(args.endpoint)
-            sock.setsockopt(zmq.RCVTIMEO, args.timeout_ms)
-            sock.setsockopt(zmq.LINGER, 0)
+                sock = ctx.socket(zmq.REQ)
+                sock.connect(args.endpoint)
+                sock.setsockopt(zmq.RCVTIMEO, args.timeout_ms)
+                sock.setsockopt(zmq.LINGER, 0)
 
-            t0 = time.perf_counter()
-            send_ts = iso_now_ms()
-            id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
-            try:
-                sock.send_json(msg)
-                reply = sock.recv_json()
-                ok += 1
-                recv_ts = iso_now_ms()
-                lat_ms = int((time.perf_counter() - t0) * 1000)
-                print(f"[PS][OK] {op} id={id_log} {lat_ms}ms ↦ {reply}")
-                records.append({
-                    "mode": args.mode,
-                    "tag": args.tag or "",
-                    "op": op,
-                    "id": id_log,
-                    "status": "OK",
-                    "latency_ms": lat_ms,
-                    "msg": reply.get("msg") if isinstance(reply, dict) else "",
-                    "t_send": send_ts,
-                    "t_recv": recv_ts,
-                    "endpoint": args.endpoint,
-                })
-            except zmq.Again:
-                fail += 1
-                print(f"[PS][WARN] Timeout para id={id_log}")
-                records.append({
-                    "mode": args.mode,
-                    "tag": args.tag or "",
-                    "op": op,
-                    "id": id_log,
-                    "status": "TIMEOUT",
-                    "latency_ms": None,
-                    "msg": "TIMEOUT",
-                    "t_send": send_ts,
-                    "t_recv": iso_now_ms(),
-                    "endpoint": args.endpoint,
-                })
-            except Exception as e:
-                fail += 1
-                print(f"[PS][ERROR] id={id_log} fallo: {e}")
-                records.append({
-                    "mode": args.mode,
-                    "tag": args.tag or "",
-                    "op": op,
-                    "id": id_log,
-                    "status": "ERROR",
-                    "latency_ms": None,
-                    "msg": str(e),
-                    "t_send": send_ts,
-                    "t_recv": iso_now_ms(),
-                    "endpoint": args.endpoint,
-                })
-            finally:
-                sock.close(0)
+                t0 = time.perf_counter()
+                send_ts = iso_now_ms()
+                id_log = msg.get("idSolicitud") or msg.get("idOperacion") or "?"
+                try:
+                    sock.send_json(msg)
+                    reply = sock.recv_json()
+                    ok += 1
+                    recv_ts = iso_now_ms()
+                    lat_ms = int((time.perf_counter() - t0) * 1000)
+                    print(f"[PS][OK] {op} id={id_log} {lat_ms}ms ↦ {reply}")
+                    records.append({
+                        "mode": args.mode,
+                        "tag": args.tag or "",
+                        "op": op,
+                        "id": id_log,
+                        "status": "OK",
+                        "latency_ms": lat_ms,
+                        "msg": reply.get("msg") if isinstance(reply, dict) else "",
+                        "t_send": send_ts,
+                        "t_recv": recv_ts,
+                        "endpoint": args.endpoint,
+                    })
+                except zmq.Again:
+                    fail += 1
+                    print(f"[PS][WARN] Timeout para id={id_log}")
+                    records.append({
+                        "mode": args.mode,
+                        "tag": args.tag or "",
+                        "op": op,
+                        "id": id_log,
+                        "status": "TIMEOUT",
+                        "latency_ms": None,
+                        "msg": "TIMEOUT",
+                        "t_send": send_ts,
+                        "t_recv": iso_now_ms(),
+                        "endpoint": args.endpoint,
+                    })
+                except Exception as e:
+                    fail += 1
+                    print(f"[PS][ERROR] id={id_log} fallo: {e}")
+                    records.append({
+                        "mode": args.mode,
+                        "tag": args.tag or "",
+                        "op": op,
+                        "id": id_log,
+                        "status": "ERROR",
+                        "latency_ms": None,
+                        "msg": str(e),
+                        "t_send": send_ts,
+                        "t_recv": iso_now_ms(),
+                        "endpoint": args.endpoint,
+                    })
+                finally:
+                    sock.close(0)
 
-            time.sleep(max(0.0, args.interval))
+                time.sleep(max(0.0, args.interval))
+
+    if args.duration_s:
+        end_time = time.perf_counter() + args.duration_s
+        while time.perf_counter() < end_time:
+            send_all_lines()
+    else:
+        send_all_lines()
 
     run_end = time.perf_counter()
     duration = max(run_end - run_start, 0.0001)
